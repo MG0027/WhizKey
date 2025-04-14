@@ -1,116 +1,146 @@
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <iostream>
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/ip.h>
 #include <string>
 #include <vector>
 
-#pragma comment(lib, "ws2_32.lib")
 
-constexpr size_t k_max_msg = 32 << 20; // 32MB
-
-void die(const char* msg) {
-    std::cerr << msg << std::endl;
-    WSACleanup();
-    exit(1);
+static void msg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
 }
 
-int read_full(SOCKET sock, char* buf, size_t n) {
+static void die(const char *msg) {
+    int err = errno;
+    fprintf(stderr, "[%d] %s\n", err, msg);
+    abort();
+}
+
+static int32_t read_full(int fd, char *buf, size_t n) {
     while (n > 0) {
-        int rv = recv(sock, buf, static_cast<int>(n), 0);
-        if (rv <= 0) return -1;
+        ssize_t rv = read(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error, or unexpected EOF
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
         buf += rv;
-        n -= rv;
     }
     return 0;
 }
 
-int write_all(SOCKET sock, const char* buf, size_t n) {
+static int32_t write_all(int fd, const char *buf, size_t n) {
     while (n > 0) {
-        int rv = send(sock, buf, static_cast<int>(n), 0);
-        if (rv <= 0) return -1;
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0) {
+            return -1;  // error
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
         buf += rv;
-        n -= rv;
     }
     return 0;
 }
 
-int32_t send_req(SOCKET sock, const char* data, size_t len) {
-    if (len > k_max_msg) return -1;
+const size_t k_max_msg = 4096;
 
-    int32_t len_net = htonl(static_cast<int32_t>(len));
-    if (write_all(sock, reinterpret_cast<const char*>(&len_net), 4)) return -1;
-    if (write_all(sock, data, len)) return -1;
+static int32_t send_req(int fd, const std::vector<std::string> &cmd) {
+    uint32_t len = 4;
+    for (const std::string &s : cmd) {
+        len += 4 + s.size();
+    }
+    if (len > k_max_msg) {
+        return -1;
+    }
 
-    return 0;
+    char wbuf[4 + k_max_msg];
+    memcpy(&wbuf[0], &len, 4);  // assume little endian
+    uint32_t n = cmd.size();
+    memcpy(&wbuf[4], &n, 4);
+    size_t cur = 8;
+    for (const std::string &s : cmd) {
+        uint32_t p = (uint32_t)s.size();
+        memcpy(&wbuf[cur], &p, 4);
+        memcpy(&wbuf[cur + 4], s.data(), s.size());
+        cur += 4 + s.size();
+    }
+    return write_all(fd, wbuf, 4 + len);
 }
 
-int32_t read_res(SOCKET sock) {
-    char buf[4];
-    if (read_full(sock, buf, 4)) return -1;
-
-    int32_t len = ntohl(*reinterpret_cast<int32_t*>(buf));
-    if (len > k_max_msg) return -1;
-
-    std::vector<char> data(len);
-    if (read_full(sock, data.data(), len)) return -1;
-
-    std::string res(data.begin(), data.end());
-    std::cout << "Server response: " << res << std::endl;
-
-    return 0;
-}
-
-int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: client <host> <port>" << std::endl;
-        return 1;
-    }
-
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        die("WSAStartup failed");
-    }
-
-    struct addrinfo hints = {};
-    struct addrinfo* res = nullptr;
-
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(argv[1], argv[2], &hints, &res) != 0) {
-        die("getaddrinfo failed");
-    }
-
-    SOCKET sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock == INVALID_SOCKET) {
-        die("socket creation failed");
-    }
-
-    if (connect(sock, res->ai_addr, static_cast<int>(res->ai_addrlen)) != 0) {
-        closesocket(sock);
-        die("connect failed");
-    }
-
-    freeaddrinfo(res);
-
-    std::string msg;
-    while (true) {
-        std::cout << "> ";
-        std::getline(std::cin, msg);
-        if (msg.empty()) break;
-
-        if (send_req(sock, msg.c_str(), msg.size()) != 0) {
-            std::cerr << "send failed" << std::endl;
-            break;
+static int32_t read_res(int fd) {
+    // 4 bytes header
+    char rbuf[4 + k_max_msg + 1];
+    errno = 0;
+    int32_t err = read_full(fd, rbuf, 4);
+    if (err) {
+        if (errno == 0) {
+            msg("EOF");
+        } else {
+            msg("read() error");
         }
-
-        if (read_res(sock) != 0) {
-            std::cerr << "read failed" << std::endl;
-            break;
-        }
+        return err;
     }
 
-    closesocket(sock);
-    WSACleanup();
+    uint32_t len = 0;
+    memcpy(&len, rbuf, 4);  // assume little endian
+    if (len > k_max_msg) {
+        msg("too long");
+        return -1;
+    }
+
+    // reply body
+    err = read_full(fd, &rbuf[4], len);
+    if (err) {
+        msg("read() error");
+        return err;
+    }
+
+    // print the result
+    uint32_t rescode = 0;
+    if (len < 4) {
+        msg("bad response");
+        return -1;
+    }
+    memcpy(&rescode, &rbuf[4], 4);
+    printf("server says: [%u] %.*s\n", rescode, len - 4, &rbuf[8]);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        die("socket()");
+    }
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = ntohs(1234);
+    addr.sin_addr.s_addr = ntohl(INADDR_LOOPBACK);  // 127.0.0.1
+    int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
+    if (rv) {
+        die("connect");
+    }
+
+    std::vector<std::string> cmd;
+    for (int i = 1; i < argc; ++i) {
+        cmd.push_back(argv[i]);
+    }
+    int32_t err = send_req(fd, cmd);
+    if (err) {
+        goto L_DONE;
+    }
+    err = read_res(fd);
+    if (err) {
+        goto L_DONE;
+    }
+
+L_DONE:
+    close(fd);
     return 0;
 }
